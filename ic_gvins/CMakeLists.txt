@@ -38,6 +38,7 @@ find_package(yaml-cpp REQUIRED)
 target_link_libraries(ic_gvins_core ${YAML_CPP_LIBRARIES})
 
 # Ceres
+set(Ceres_DIR /home/zyp/bin/ceres-solver-2.1.0/usr/local/lib/cmake/Ceres)
 find_package(Ceres REQUIRED)
 target_link_libraries(ic_gvins_core ${CERES_LIBRARIES})
 
