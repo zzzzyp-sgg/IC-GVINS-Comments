@@ -134,6 +134,7 @@ void FusionROS::imuCallback(const sensor_msgs::ImuConstPtr &imumsg) {
     imu_.dt = imu_.time - imu_pre_.time;
 
     // IMU measurements, Front-Right-Down
+    // 所以数据的格式也是比力和角速度，只需要乘个dt就可以
     imu_.dtheta[0] = imumsg->angular_velocity.x * imu_.dt;
     imu_.dtheta[1] = imumsg->angular_velocity.y * imu_.dt;
     imu_.dtheta[2] = imumsg->angular_velocity.z * imu_.dt;
@@ -187,6 +188,7 @@ void FusionROS::gnssCallback(const sensor_msgs::NavSatFixConstPtr &gnssmsg) {
     bool isoutage = false;
     if ((gnss_.std[0] < gnssthreshold_) && (gnss_.std[1] < gnssthreshold_) && (gnss_.std[2] < gnssthreshold_)) {
 
+        // 超出设置的时间后，就不再添加新的GNSS数据了
         if (isusegnssoutage_ && (weeksec >= gnssoutagetime_)) {
             isoutage = true;
         }
