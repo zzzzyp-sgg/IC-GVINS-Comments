@@ -35,6 +35,7 @@ Frame::Frame(ulong id, double stamp, Mat image)
 }
 
 Frame::Ptr Frame::createFrame(double stamp, const Mat &image) {
+    // 定义成static，这样frame的id就在一直随着调用增加
     static ulong factory_id = 0;
 
     return std::make_shared<Frame>(factory_id++, stamp, image);

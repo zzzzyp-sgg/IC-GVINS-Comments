@@ -169,6 +169,7 @@ GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr dra
 bool GVINS::addNewImu(const IMU &imu) {
     if (imu_buffer_mutex_.try_lock()) {
         if (imu.dt > (imudatadt_ * 1.5)) {
+            // 这里是看了下IMU数据有没有缺失
             LOGE << absl::StrFormat("Lost IMU data with at %0.3lf dt %0.3lf", imu.time, imu.dt);
 
             long cnts = lround(imu.dt / imudatadt_) - 1;
@@ -220,6 +221,7 @@ bool GVINS::addNewGnss(const GNSS &gnss) {
 }
 
 bool GVINS::addNewFrame(const Frame::Ptr &frame) {
+    // 添加图像帧的条件是必须ins初始化完成
     if (gvinsstate_ > GVINS_INITIALIZING_INS) {
         if (frame_buffer_mutex_.try_lock()) {
             frame_buffer_.push(frame);
@@ -479,9 +481,9 @@ void GVINS::runOptimization() {
 void GVINS::runTracking() {
     Frame::Ptr frame;
     Pose pose;
-    IntegrationState state, state0, state1;
+    IntegrationState state, state0, state1; // 这三个在runTracking()里面没用到，不太知道为什么定义在这
 
-    std::deque<std::pair<IMU, IntegrationState>> ins_windows;
+    std::deque<std::pair<IMU, IntegrationState>> ins_windows;   // 这个也是...
 
     LOGI << "Tracking thread is started";
     while (!isfinished_) {
@@ -510,6 +512,7 @@ void GVINS::runTracking() {
                 // Wait until the INS is available
                 ins_mutex_.lock();
                 if (ins_window_.empty() || (ins_window_.back().second.time <= (frame->stamp() + td))) {
+                    // 这里加的条件就是让frame等到包含它的IMU窗口
                     ins_mutex_.unlock();
                     frame_buffer_mutex_.unlock();
 
@@ -581,6 +584,7 @@ void GVINS::setFinished() {
     Logging::shutdownLogging();
 }
 
+/* 这里的初始化是利用GINS的初始化 */
 bool GVINS::gvinsInitialization() {
 
     if ((gnss_.time == 0) || (last_gnss_.time == 0)) {
@@ -607,6 +611,7 @@ bool GVINS::gvinsInitialization() {
     static Vector3d initatt{0, 0, 0};
     static bool is_has_zero_velocity = false;
 
+    // 这里的零速检测也是用增量形式判断的，相当于一个窗口内的std
     bool is_zero_velocity = MISC::detectZeroVelocity(imu_buff, imudatarate_, average);
     if (is_zero_velocity) {
         // 陀螺零偏
@@ -674,6 +679,7 @@ bool GVINS::gvinsInitialization() {
     // The gravity and the Earth rotation rate
     integration_config_.gravity = Vector3d(0, 0, integration_parameters_->gravity);
     if (integration_config_.iswithearth) {
+        // 根据状态的位置来计算地球自转参数
         integration_config_.iewn = Earth::iewn(integration_config_.origin, state.p);
     }
 
@@ -850,7 +856,7 @@ bool GVINS::insertNewGnssTimeNode() {
         gnss.blh[0] += statedatalist_[index].mix[0] * dt;
         gnss.blh[1] += statedatalist_[index].mix[1] * dt;
         gnss.blh[2] += statedatalist_[index].mix[2] * dt;
-        gnss.std *= 1.2;
+        gnss.std *= 1.2;        // 1.2是一个经验值
 
         gnsslist_.push_back(gnss);
         LOGI << "Add new GNSS " << Logging::doubleData(gnss_.time) << " align to " << Logging::doubleData(end);
@@ -910,11 +916,13 @@ void GVINS::addNewTimeNode(double time) {
     // 新建立新的预积分
     // Build a new IMU preintegration
     preintegrationlist_.emplace_back(
+        // createPreintegration 这个函数只是把预积分的对象建立出来
         Preintegration::createPreintegration(integration_parameters_, series[0], state, preintegration_options_));
 
     // 预积分, 从第二个历元开始
     // Add IMU sample
     for (size_t k = 1; k < series.size(); k++) {
+        // 这里进行预积分的操作
         preintegrationlist_.back()->addNewImu(series[k]);
     }
 
@@ -1908,6 +1916,10 @@ vector<std::pair<ceres::ResidualBlockId, GNSS *>> GVINS::addGnssFactors(ceres::P
     return residual_block;
 }
 
+/**
+ * @brief 构建先验信息
+ * @param[in] is_zero_velocity 是否认为是零速状态
+*/
 void GVINS::constructPrior(bool is_zero_velocity) {
     double pos_prior_std  = 0.1;                                       // 0.1 m
     double att_prior_std  = 0.5 * D2R;                                 // 0.5 deg

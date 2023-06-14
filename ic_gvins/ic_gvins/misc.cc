@@ -64,6 +64,14 @@ size_t MISC::getInsWindowIndex(const std::deque<std::pair<IMU, IntegrationState>
     return index;
 }
 
+/**
+ * @brief 通过惯导数据窗口获取帧的位姿
+ * @param[in]     window      惯导数据窗口
+ * @param[in]     pose_b_c    相机和IMU之间的外参
+ * @param[in]     time        图像帧的时间戳
+ * @param[inout]  pose        frame的位姿
+ * @return bool 是否成功获取帧的位姿 
+*/
 bool MISC::getCameraPoseFromInsWindow(const std::deque<std::pair<IMU, IntegrationState>> &window, const Pose &pose_b_c,
                                       double time, Pose &pose) {
     // 位置内插
@@ -77,6 +85,8 @@ bool MISC::getCameraPoseFromInsWindow(const std::deque<std::pair<IMU, Integratio
         pose = stateToCameraPose(state, pose_b_c);
         return true;
     } else {
+        // 如果窗口里没有就用窗口最后一个位姿进行传播
+        // 前面已经设置过一次要在窗口内了，这里就是做个保险？
         pose = stateToCameraPose(window.back().second, pose_b_c);
         return false;
     }
@@ -148,6 +158,12 @@ size_t MISC::getStateDataIndex(const std::deque<double> &timelist, double time, 
     return index;
 }
 
+/**
+ * @brief 机械编排
+ * @param[in]    config            惯导解算的设置
+ * @param[in]    imu_pre, imu_cur  进行编排的惯导值
+ * @param[inout] state             状态量
+*/
 void MISC::insMechanization(const IntegrationConfiguration &config, const IMU &imu_pre, const IMU &imu_cur,
                             IntegrationState &state) {
 
@@ -205,6 +221,13 @@ void MISC::insMechanization(const IntegrationConfiguration &config, const IMU &i
     state.v += dvel;
 }
 
+/**
+ * @brief 计算第一秒(个人理解:窗口内的第一秒)的INS结果
+ * @param[in] config            INS解算的配置，eg是否考虑地球自转等
+ * @param[in] state             初始状态
+ * @param[in] reserved_ins_num  移除INS数据的阈值
+ * @param[in] ins_windows       INS数据
+*/
 void MISC::redoInsMechanization(const IntegrationConfiguration &config, const IntegrationState &updated_state,
                                 size_t reserved_ins_num, std::deque<std::pair<IMU, IntegrationState>> &ins_windows) {
     // 最新的优化过的位姿
@@ -246,6 +269,7 @@ void MISC::redoInsMechanization(const IntegrationConfiguration &config, const In
         imu0 = imu1;
 
         imu1 = ins_windows[k].first;
+        // 把窗口内之后的以此都进行机械编排了
         insMechanization(config, imu0, imu1, state);
         ins_windows[k].second = state;
     }

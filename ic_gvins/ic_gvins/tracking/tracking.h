@@ -36,11 +36,11 @@
 #include <fstream>
 
 typedef enum TrackState {
-    TRACK_FIRST_FRAME,
-    TRACK_INITIALIZING,
-    TRACK_TRACKING,
-    TRACK_PASSED,
-    TRACK_LOST,
+    TRACK_FIRST_FRAME,      // 第一帧
+    TRACK_INITIALIZING,     // 初始化
+    TRACK_TRACKING,         // 跟踪状态
+    TRACK_PASSED,           // PASS？
+    TRACK_LOST,             // 跟踪丢失
 } TrackState;
 
 class Tracking {

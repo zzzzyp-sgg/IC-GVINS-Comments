@@ -51,8 +51,8 @@ typedef struct IMU {
     double time;
     double dt;
 
-    Vector3d dtheta;
-    Vector3d dvel;
+    Vector3d dtheta;    // 角增量的格式
+    Vector3d dvel;      // 速度增量的格式
 
     double odovel;
 } IMU;

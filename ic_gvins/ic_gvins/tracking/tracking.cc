@@ -29,6 +29,10 @@
 #include <tbb/tbb.h>
 #include <yaml-cpp/yaml.h>
 
+/**
+ * @param isnewkeyframe_    是不是新的关键帧，默认为false
+ * @param isinitializing_   初始化的标志
+*/
 Tracking::Tracking(Camera::Ptr camera, Map::Ptr map, Drawer::Ptr drawer, const string &configfile,
                    const string &outputpath)
     : frame_cur_(nullptr)
@@ -48,6 +52,7 @@ Tracking::Tracking(Camera::Ptr camera, Map::Ptr map, Drawer::Ptr drawer, const s
 
     YAML::Node config;
     std::vector<double> vecdata;
+    // IC-GVINS反复读了几次配置文件，可以考虑优化一下
     config = YAML::LoadFile(configfile);
 
     track_check_histogram_ = config["track_check_histogram"].as<bool>();
@@ -60,6 +65,7 @@ Tracking::Tracking(Camera::Ptr camera, Map::Ptr map, Drawer::Ptr drawer, const s
     reprojection_error_std_ = config["reprojection_error_std"].as<double>();
 
     // 直方图均衡化
+    // 图像增强算法，通过增强图像的对比度来提高图像的视觉质量和细节可见性。(ChatGPT)
     clahe_ = cv::createCLAHE(3.0, cv::Size(21, 21));
 
     // 分块索引
@@ -68,6 +74,7 @@ Tracking::Tracking(Camera::Ptr camera, Map::Ptr map, Drawer::Ptr drawer, const s
     block_cnts_ = block_cols_ * block_rows_;
 
     int col, row;
+    // block_indexs_ 存储的是图像分块之后，每一个小块在图像上的索引
     row = camera_->height() / block_rows_;
     col = camera_->width() / block_cols_;
     block_indexs_.emplace_back(std::make_pair(col, row));
@@ -82,6 +89,7 @@ Tracking::Tracking(Camera::Ptr camera, Map::Ptr map, Drawer::Ptr drawer, const s
         static_cast<int>(lround(static_cast<double>(track_max_features_) / static_cast<double>(block_cnts_)));
 
     // 每个格子的提取特征数量平方面积为格子面积的 2/3
+    // 制特征点之间的最小像素距离，以控制特征点的分布密度和稳定性，避免特征点过于密集或重叠
     track_min_pixel_distance_ = static_cast<int>(round(TRACK_BLOCK_SIZE / sqrt(track_max_block_features_ * 1.5)));
 }
 
@@ -104,6 +112,9 @@ double Tracking::calculateHistigram(const Mat &image) {
     return hist;
 }
 
+/**
+ * @brief 图像的预处理，主要是直方图，然后还有帧的这个递推
+*/
 bool Tracking::preprocessing(Frame::Ptr frame) {
     isnewkeyframe_ = false;
 
@@ -114,6 +125,7 @@ bool Tracking::preprocessing(Frame::Ptr frame) {
 
     if (track_check_histogram_) {
         // 计算直方图参数
+        // 直方图主要是防止图像之间的变化太剧烈
         double hist = calculateHistigram(frame->image());
         if (histogram_ != 0) {
             double rate = fabs((hist - histogram_) / histogram_);
@@ -156,10 +168,12 @@ TrackState Tracking::track(Frame::Ptr frame) {
     if (isinitializing_) {
         // Initialization
         if (frame_ref_ == nullptr) {
+            // 没有参考帧，就把当前帧设为参考帧，然后把变量都重置了
             doResetTracking();
 
             frame_ref_ = frame_cur_;
 
+            // featureDetection进行特征点的提取
             featuresDetection(frame_ref_, false);
 
             return TRACK_FIRST_FRAME;
@@ -462,6 +476,7 @@ bool Tracking::trackReferenceFrame() {
     }
 
     // 补偿旋转预测
+    // 这里的pose就是用惯导给的初始先验位姿
     Matrix3d r_cur_pre = frame_cur_->pose().R.transpose() * frame_pre_->pose().R;
 
     // 原始畸变补偿
@@ -610,6 +625,8 @@ void Tracking::featuresDetection(Frame::Ptr &frame, bool ismask) {
     if (ismask) {
         // 已经跟踪上的点
         for (const auto &pt : frame_cur_->features()) {
+            // cv::circle的第二个参数是圆心点坐标
+            // 这个操作本质上和VINS是一样的，都是在已经有特征点的周围设置mask
             cv::circle(mask, pt.second->keyPoint(), track_min_pixel_distance_, 0, cv::FILLED);
         }
 
@@ -622,17 +639,22 @@ void Tracking::featuresDetection(Frame::Ptr &frame, bool ismask) {
     // 亚像素角点提取参数
     cv::Size win_size          = cv::Size(5, 5);
     cv::Size zero_zone         = cv::Size(-1, -1);
+    // COUNT是达到最大迭代次数，EPS是达到迭代精度，两者可以同时使用
     cv::TermCriteria term_crit = cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 20, 0.01);
 
+    /**
+     * @brief lambda表达式表示的跟踪函数
+     * @param range 图像分格的总数
+    */
     auto tracking_function = [&](const tbb::blocked_range<int> &range) {
         for (int k = range.begin(); k != range.end(); k++) {
             int blocl_track_num = track_max_block_features_ - features_cnts[k];
             if (blocl_track_num > 0) {
 
-                int cols = k % block_cols_;
-                int rows = k / block_cols_;
+                int cols = k % block_cols_; // 取余数，对应的就是列
+                int rows = k / block_cols_; // 取整，对应行
 
-                int col_sta = cols * block_indexs_[0].first;
+                int col_sta = cols * block_indexs_[0].first;    // 四个角的索引
                 int col_end = col_sta + block_indexs_[0].first;
                 int row_sta = rows * block_indexs_[0].second;
                 int row_end = row_sta + block_indexs_[0].second;
@@ -648,6 +670,7 @@ void Tracking::featuresDetection(Frame::Ptr &frame, bool ismask) {
                                         track_min_pixel_distance_, block_mask);
                 if (!block_features[k].empty()) {
                     // 获取亚像素角点
+                    // block_features 既输入又输出
                     cv::cornerSubPix(block_image, block_features[k], win_size, zero_zone, term_crit);
                 }
             }
@@ -671,7 +694,7 @@ void Tracking::featuresDetection(Frame::Ptr &frame, bool ismask) {
         row = k / block_cols_;
 
         for (const auto &point : block_features[k]) {
-            float x = static_cast<float>(col * block_indexs_[0].first) + point.x;
+            float x = static_cast<float>(col * block_indexs_[0].first) + point.x;   // 恢复特征点在图像上的坐标
             float y = static_cast<float>(row * block_indexs_[0].second) + point.y;
 
             auto pts2d = cv::Point2f(x, y);
