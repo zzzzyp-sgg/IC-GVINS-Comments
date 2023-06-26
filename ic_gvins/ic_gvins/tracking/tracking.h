@@ -51,6 +51,7 @@ public:
     Tracking(Camera::Ptr camera, Map::Ptr map, Drawer::Ptr drawer, const string &configfile, const string &outputpath);
 
     TrackState track(Frame::Ptr frame);
+    TrackState trackStereo(Frame::Ptr frame);
 
     bool isNewKeyFrame() const {
         return isnewkeyframe_;
@@ -63,6 +64,7 @@ public:
 private:
     void showTracking();
 
+    bool perprocessingStereo(Frame::Ptr frame);
     bool preprocessing(Frame::Ptr frame);
     static double calculateHistigram(const Mat &image);
 
@@ -88,6 +90,7 @@ private:
     double keyPointParallax(const cv::Point2f &pp0, const cv::Point2f &pp1, const Pose &pose0, const Pose &pose1);
 
     void featuresDetection(Frame::Ptr &frame, bool ismask = true);
+    void featuresDetectionStereo(Frame::Ptr &frame, bool ismask = true, bool is_stereo);
 
     bool triangulation();
     static void triangulatePoint(const Eigen::Matrix<double, 3, 4> &pose0, const Eigen::Matrix<double, 3, 4> &pose1,
@@ -161,6 +164,9 @@ private:
     double reprojection_error_std_;
 
     bool is_use_visualization_;
+
+    // 双目
+    bool is_stereo_ = true;
 
     FileSaver::Ptr logfilesaver_;
 
