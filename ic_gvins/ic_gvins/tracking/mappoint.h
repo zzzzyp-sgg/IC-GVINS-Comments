@@ -73,6 +73,7 @@ public:
                                         double depth, MapPointType type);
 
     void addObservation(const Feature::Ptr &feature);
+    void addRightObservation(const Feature::Ptr &featurer);
 
     void increaseUsedTimes() {
         std::unique_lock<std::mutex> lock(mappoint_mutex_);
@@ -111,6 +112,11 @@ public:
         return observations_;
     }
 
+    std::vector<std::weak_ptr<Feature>> rightObservations() {
+        std::unique_lock<std::mutex> lock(mappoint_mutex_);
+        return observations_right_;
+    }
+
     void setOutlier(bool isoutlier) {
         std::unique_lock<std::mutex> lock(mappoint_mutex_);
 
@@ -147,9 +153,18 @@ public:
         return ref_frame_.lock();
     }
 
+    void setRightKeypoint(const cv::Point2f &kp) {
+        ref_frame_keypoint_right_ = kp;
+    }
+
     const cv::Point2f &referenceKeypoint() {
         std::unique_lock<std::mutex> lock(mappoint_mutex_);
         return ref_frame_keypoint_;
+    }
+
+    const cv::Point2f &referenceRightKeypoint() {
+        std::unique_lock<std::mutex> lock(mappoint_mutex_);
+        return ref_frame_keypoint_right_;
     }
 
     bool isNeedUpdate() {
@@ -159,6 +174,7 @@ public:
 
 private:
     std::vector<std::weak_ptr<Feature>> observations_;
+    std::vector<std::weak_ptr<Feature>> observations_right_;
 
     std::mutex mappoint_mutex_;
     bool isneedupdate_{false};
@@ -167,7 +183,7 @@ private:
 
     // 参考帧中的深度
     double depth_{DEFAULT_DEPTH}, depth_tmp_{DEFAULT_DEPTH};
-    cv::Point2f ref_frame_keypoint_, ref_frame_keypoint_tmp_;
+    cv::Point2f ref_frame_keypoint_, ref_frame_keypoint_tmp_, ref_frame_keypoint_right_;
     std::weak_ptr<Frame> ref_frame_, ref_frame_tmp_;
 
     int optimized_times_;

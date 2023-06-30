@@ -148,6 +148,7 @@ private:
     std::deque<double> timelist_;
     std::unordered_map<ulong, double> invdepthlist_;
     double extrinsic_[8]{0};
+    double extrinsic_r_[7]{0};
 
     std::vector<double> unused_time_nodes_;
 
@@ -168,7 +169,7 @@ private:
     // GVINS fusion objects
     Tracking::Ptr tracking_;
     Map::Ptr map_;
-    Camera::Ptr camera_;
+    Camera::Ptr camera_, camera_r_;
     Drawer::Ptr drawer_;
 
     // 多线程
@@ -233,11 +234,12 @@ private:
 
     // 外参
     // Camera-IMU extrinsic
-    Pose pose_b_c_;
+    Pose pose_b_c_, pose_b_c_r_;
     double td_b_c_;
     std::mutex extrinsic_mutex_;
 
     bool is_use_visualization_{true};
+    bool is_stereo_{false};
 
     // 优化选项
     // Optimization options

@@ -33,7 +33,7 @@
  * @param isnewkeyframe_    是不是新的关键帧，默认为false
  * @param isinitializing_   初始化的标志
 */
-Tracking::Tracking(Camera::Ptr camera, Map::Ptr map, Drawer::Ptr drawer, const string &configfile,
+Tracking::Tracking(Camera::Ptr camera, Camera::Ptr camera_r, Map::Ptr map, Drawer::Ptr drawer, const string &configfile,
                    const string &outputpath)
     : frame_cur_(nullptr)
     , frame_ref_(nullptr)
@@ -63,6 +63,10 @@ Tracking::Tracking(Camera::Ptr camera, Map::Ptr map, Drawer::Ptr drawer, const s
 
     is_use_visualization_   = config["is_use_visualization"].as<bool>();
     reprojection_error_std_ = config["reprojection_error_std"].as<double>();
+
+    is_stereo_ = (config["camera_num"].as<int>() == 2) ? 1 : 0;
+    if (is_stereo_ == 1)
+        camera_r_ = std::move(camera_r);
 
     // 直方图均衡化
     // 图像增强算法，通过增强图像的对比度来提高图像的视觉质量和细节可见性。(ChatGPT)
@@ -113,6 +117,53 @@ double Tracking::calculateHistigram(const Mat &image) {
 }
 
 /**
+ * @brief 双目的预处理
+*/
+bool Tracking::preprocessingStereo(Frame::Ptr frame) {
+    isnewkeyframe_ = false;
+
+    // 彩色转灰度
+    if (frame->image().channels() == 3) {
+        cv::cvtColor(frame->image(), frame->image(), cv::COLOR_BGR2GRAY);
+    }
+    if (frame->rightImage().channels() == 3) {
+        cv::cvtColor(frame->rightImage(), frame->rightImage(), cv::COLOR_BGR2GRAY);
+    }
+
+    if (track_check_histogram_) {
+        // 计算直方图参数
+        // 直方图主要是防止图像之间的变化太剧烈
+        double hist = calculateHistigram(frame->image());
+        double hist_right = calculateHistigram(frame->rightImage());
+        if (histogram_ != 0) {
+            double rate = fabs((hist - histogram_) / histogram_);
+            double rate_right = fabs((hist_right - histogram_) / histogram_);
+
+            // 图像直方图变化比例大于10%, 则跳过当前帧
+            if ((rate > 0.1) || (rate_right > 0.1)) {
+                LOGW << "Histogram change too large at " << Logging::doubleData(frame->stamp()) << " with " << rate;
+                passed_cnt_++;
+
+                if (passed_cnt_ > 1) {
+                    histogram_ = 0;
+                }
+                return false;
+            }
+        }
+        histogram_ = hist;
+    }
+
+    frame_pre_ = frame_cur_;
+    frame_cur_ = std::move(frame);
+
+    // 直方图均衡化
+    clahe_->apply(frame_cur_->image(), frame_cur_->image());
+    clahe_->apply(frame_cur_->rightImage(), frame_cur_->rightImage());
+
+    return true;
+}
+
+/**
  * @brief 图像的预处理，主要是直方图，然后还有帧的这个递推
 */
 bool Tracking::preprocessing(Frame::Ptr frame) {
@@ -151,6 +202,111 @@ bool Tracking::preprocessing(Frame::Ptr frame) {
     clahe_->apply(frame_cur_->image(), frame_cur_->image());
 
     return true;
+}
+
+TrackState Tracking::trackStereo(Frame::Ptr frame) {
+    // 双目跟踪
+
+    timecost_.restart();
+
+    TrackState track_state = TRACK_PASSED;
+
+    // 预处理
+    if (!preprocessingStereo(std::move(frame))) {
+        return track_state;
+    }
+
+    if (isinitializing_) {
+        // Initialization
+        if (frame_ref_ == nullptr) {
+            // 没有参考帧，就把当前帧设为参考帧，然后把变量都重置了
+            doResetTrackingStereo();
+
+            frame_ref_ = frame_cur_;
+
+            // featureDetection进行特征点的提取
+            featuresDetectionStereo(frame_ref_, false);
+
+            return TRACK_FIRST_FRAME;
+        }
+
+        if (pts2d_ref_.empty()) {
+            featuresDetectionStereo(frame_ref_, false);
+        }
+
+        // 从参考帧跟踪过来的特征点
+        trackReferenceFrameStereo();
+
+        if (parallax_ref_ < track_min_parallax_) {
+            showTracking();
+            return TRACK_INITIALIZING;
+        }
+
+        LOGI << "Initialization tracking with parallax " << parallax_ref_;
+
+        triangulationStereo();  // TODO 两个相机的位姿
+
+        if (doResetTrackingStereo()) {
+            LOGW << "Reset initialization";
+            showTracking();
+
+            makeNewFrame(KEYFRAME_NORMAL);
+            return TRACK_FIRST_FRAME;
+        }
+
+        // 初始化两帧都是关键帧
+        frame_ref_->setKeyFrame(KEYFRAME_NORMAL);
+
+        // 新关键帧, 地图更新, 数据转存
+        makeNewFrameStereo(KEYFRAME_NORMAL);
+        last_keyframe_ = frame_cur_;
+
+        isinitializing_ = false;
+
+        track_state = TRACK_TRACKING;
+    } else {
+        // Tracking
+
+        // 跟踪上一帧中带路标点的特征, 利用预测的位姿先验
+        trackMappointStereo();
+
+        // 未关联路标点的新特征, 补偿旋转预测
+        trackReferenceFrameStereo();
+
+        // 检查关键帧类型
+        auto keyframe_state = checkKeyFrameSate();
+
+        // 正常关键帧, 需要三角化路标点
+        if ((keyframe_state == KEYFRAME_NORMAL) || (keyframe_state == KEYFRAME_REMOVE_OLDEST)) {
+            // 三角化补充路标点
+            triangulationStereo();
+        } else {
+            // 添加新的特征
+            featuresDetectionStereo(frame_cur_, true);
+        }
+
+        // 跟踪失败, 路标点数据严重不足
+        if (doResetTrackingStereo()) {
+            makeNewFrameStereo(KEYFRAME_NORMAL);
+            return TRACK_LOST;
+        }
+
+        // 观测帧, 进行插入
+        if (keyframe_state != KEYFRAME_NONE) {
+            makeNewFrameStereo(keyframe_state);
+        }
+
+        track_state = TRACK_TRACKING;
+
+        if (keyframe_state != KEYFRAME_NONE) {
+            writeLoggingMessage();
+        }
+    }
+
+    // 显示跟踪情况
+    showTracking();
+
+    return track_state;
 }
 
 TrackState Tracking::track(Frame::Ptr frame) {
@@ -274,6 +430,18 @@ void Tracking::makeNewFrame(int state) {
     }
 }
 
+void Tracking::makeNewFrameStereo(int state) {
+    frame_cur_->setKeyFrame(state);
+    isnewkeyframe_ = true;
+
+    // 仅当正常关键帧才更新参考帧
+    if ((state == KEYFRAME_NORMAL) || (state == KEYFRAME_REMOVE_OLDEST)) {
+        frame_ref_ = frame_cur_;
+
+        featuresDetectionStereo(frame_ref_, true);
+    }
+}
+
 keyFrameState Tracking::checkKeyFrameSate() {
     keyFrameState keyframe_state = KEYFRAME_NONE;
 
@@ -328,6 +496,22 @@ void Tracking::writeLoggingMessage() {
     logfilesaver_->flush();
 }
 
+bool Tracking::doResetTrackingStereo() {
+    if (!frame_cur_->numFeatures()) {
+        isinitializing_ = true;
+        frame_ref_      = frame_cur_;
+        pts2d_new_.clear();
+        pts2d_new_right_.clear();
+        pts2d_ref_.clear();
+        pts2d_ref_right_.clear();
+        pts2d_ref_frame_.clear();
+        velocity_ref_.clear();
+        return true;
+    }
+
+    return false;
+}
+
 bool Tracking::doResetTracking() {
     if (!frame_cur_->numFeatures()) {
         isinitializing_ = true;
@@ -360,6 +544,162 @@ void Tracking::showTracking() {
     }
 
     drawer_->updateFrame(frame_cur_);
+}
+
+bool Tracking::trackMappointStereo() {
+
+    // 上一帧中的路标点
+    mappoint_matched_.clear();
+    mappoint_matched_right_.clear();
+    vector<cv::Point2f> pts2d_map, pts2d_matched, pts2d_map_undis;
+    vector<cv::Point2f> pts2d_map_right, pts2d_matched_right, pts2d_map_undis_right;
+    vector<MapPointType> mappoint_type, mappoint_type_right;
+    auto features   = frame_pre_->features();
+    auto features_r = frame_pre_->features_right(); 
+    for (auto &feature : features) {    // 左目
+        auto mappoint = feature.second->getMapPoint();
+        if (mappoint && !mappoint->isOutlier()) {
+            mappoint_matched_.push_back(mappoint);
+            pts2d_map_undis.push_back(feature.second->keyPoint());
+            pts2d_map.push_back(feature.second->distortedKeyPoint());
+            mappoint_type.push_back(mappoint->mapPointType());
+
+            // 预测的特征点
+            auto pixel = camera_->world2pixel(mappoint->pos(), frame_cur_->pose());
+
+            pts2d_matched.emplace_back(pixel);
+        }
+    }
+    for (auto &feature : features_r) {    // 右目
+        auto mappoint = feature.second->getMapPoint();
+        if (mappoint && !mappoint->isOutlier()) {
+            mappoint_matched_right_.push_back(mappoint);
+            pts2d_map_undis_right.push_back(feature.second->keyPoint());
+            pts2d_map_right.push_back(feature.second->distortedKeyPoint());
+            mappoint_type_right.push_back(mappoint->mapPointType());
+
+            // 预测的特征点
+            auto pixel = camera_r_->world2pixel(mappoint->pos(), frame_cur_->pose());
+
+            pts2d_matched_right.emplace_back(pixel);
+        }
+    }
+    if (pts2d_matched.empty() || pts2d_matched_right.empty()) {
+        LOGE << "No feature with mappoint in previous frame";
+        return false;
+    }
+
+    // 预测的特征点像素坐标添加畸变, 用于跟踪
+    camera_->distortPoints(pts2d_matched);
+    camera_r_->distortPoints(pts2d_matched_right);
+
+    vector<uint8_t> status, status_right, status_reverse, status_reverse_right;
+    vector<float> error;
+    vector<cv::Point2f> pts2d_reverse       = pts2d_map;
+    vector<cv::Point2f> pts2d_reverse_right = pts2d_map_right;
+
+    // 正向光流
+    cv::calcOpticalFlowPyrLK(frame_pre_->image(), frame_cur_->image(), pts2d_map, pts2d_matched, status, error,
+                             cv::Size(21, 21), TRACK_PYRAMID_LEVEL,
+                             cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01),
+                             cv::OPTFLOW_USE_INITIAL_FLOW);
+    // 反向光流
+    cv::calcOpticalFlowPyrLK(frame_cur_->image(), frame_pre_->image(), pts2d_matched, pts2d_reverse, status_reverse,
+                             error, cv::Size(21, 21), TRACK_PYRAMID_LEVEL,
+                             cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01),
+                             cv::OPTFLOW_USE_INITIAL_FLOW);
+
+    // 右目正向光流
+    cv::calcOpticalFlowPyrLK(frame_pre_->rightImage(), frame_cur_->rightImage(), pts2d_map_right, pts2d_matched_right, status_right, error,
+                             cv::Size(21, 21), TRACK_PYRAMID_LEVEL,
+                             cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01),
+                             cv::OPTFLOW_USE_INITIAL_FLOW);
+    // 右目反向光流
+    cv::calcOpticalFlowPyrLK(frame_cur_->rightImage(), frame_pre_->rightImage(), pts2d_matched_right, pts2d_reverse_right, status_reverse_right,
+                             error, cv::Size(21, 21), TRACK_PYRAMID_LEVEL,
+                             cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01),
+                             cv::OPTFLOW_USE_INITIAL_FLOW);
+
+    // 跟踪失败的
+    for (size_t k = 0; k < status.size(); k++) {
+        if (status[k] && status_reverse[k] && !isOnBorder(pts2d_matched[k]) &&
+            (ptsDistance(pts2d_reverse[k], pts2d_map[k]) < 0.5) &&
+            status_right[k] && status_reverse_right[k] && !isOnBorder(pts2d_matched_right[k]) &&
+            (ptsDistance(pts2d_reverse_right[k], pts2d_map_right[k]) < 0.5)) {
+            status[k] = 1;
+        } else {
+            status[k] = 0;
+        }
+    }
+    reduceVector(pts2d_map, status);
+    reduceVector(pts2d_matched, status);
+    reduceVector(mappoint_matched_, status);
+    reduceVector(mappoint_type, status);
+    reduceVector(pts2d_map_undis, status);
+    reduceVector(pts2d_map_right, status);
+    reduceVector(pts2d_matched_right, status);
+    reduceVector(mappoint_matched_right_, status);
+    reduceVector(mappoint_type_right, status);
+    reduceVector(pts2d_map_undis_right, status);
+
+    if (pts2d_matched.empty() || pts2d_matched_right.empty()) {
+        LOGE << "Track previous with mappoint failed";
+        // 清除上一帧的跟踪
+        if (is_use_visualization_) {
+            drawer_->updateTrackedMapPoints({}, {}, {});
+        }
+        parallax_map_        = 0;
+        parallax_map_counts_ = 0;
+        return false;
+    }
+
+    // 匹配后的点, 需要重新矫正畸变
+    auto pts2d_matched_undis = pts2d_matched;
+    camera_->undistortPoints(pts2d_matched_undis);
+    auto pts2d_matched_undis_right = pts2d_matched_right;
+    camera_r_->undistortPoints(pts2d_matched_undis_right);
+
+    // 匹配的3D-2D
+    frame_cur_->clearFeatures();
+    tracked_mappoint_.clear();
+
+    double dt = frame_cur_->stamp() - frame_pre_->stamp();
+    for (size_t k = 0; k < pts2d_matched_undis.size(); k++) {
+        auto mappoint = mappoint_matched_[k];
+
+        // 将3D-2D匹配到的landmarks指向到当前帧
+        auto velocity = (camera_->pixel2cam(pts2d_matched_undis[k]) - camera_->pixel2cam(pts2d_map_undis[k])) / dt;
+        auto feature  = Feature::createFeature(frame_cur_, {velocity.x(), velocity.y()}, pts2d_matched_undis[k],
+                                               pts2d_matched[k], FEATURE_MATCHED);
+        auto featurer = Feature::createFeature(frame_cur_, {velocity.x(), velocity.y()}, pts2d_matched_undis_right[k],
+                                               pts2d_matched_right[k], FEATURE_MATCHED);
+        mappoint->addObservation(feature);
+        feature->addMapPoint(mappoint);
+        frame_cur_->addFeature(mappoint->id(), feature);
+
+        tracked_mappoint_.push_back(mappoint);
+
+        // 将3D-2D匹配到的landmarks指向到当前帧
+        auto velocity_r = (camera_r_->pixel2cam(pts2d_matched_undis_right[k]) - camera_r_->pixel2cam(pts2d_map_undis_right[k])) / dt;
+        auto feature_r  = Feature::createFeature(frame_cur_, {velocity_r.x(), velocity_r.y()}, pts2d_matched_undis_right[k],
+                                                 pts2d_matched_right[k], FEATURE_MATCHED);
+        // mappoint->addObservation(feature);
+        feature_r->addMapPoint(mappoint);
+        feature->setRightFeature(feature_r);
+        mappoint->addRightObservation(feature_r);
+        frame_cur_->addFeatureRight(mappoint->id(), feature_r);
+    }
+
+    // 路标点跟踪情况
+    if (is_use_visualization_) {
+        drawer_->updateTrackedMapPoints(pts2d_map, pts2d_matched, mappoint_type);
+    }
+
+    parallax_map_counts_ = parallaxFromReferenceMapPoints(parallax_map_);
+
+    LOGI << "Track " << tracked_mappoint_.size() << " map points";
+
+    return true;
 }
 
 bool Tracking::trackMappoint() {
@@ -466,6 +806,187 @@ bool Tracking::trackMappoint() {
     LOGI << "Track " << tracked_mappoint_.size() << " map points";
 
     return true;
+}
+
+bool Tracking::trackReferenceFrameStereo() {
+
+    if (pts2d_ref_.empty()) {
+        LOGW << "No new feature in previous frame " << Logging::doubleData(frame_cur_->stamp());
+        return false;
+    }
+
+    // 补偿旋转预测
+    // TODO 右目的位姿
+    Matrix3d r_cur_pre = frame_cur_->pose().R.transpose() * frame_pre_->pose().R;
+    Matrix3d r_cur_pre_r = frame_cur_->poseR().R.transpose() * frame_pre_->poseR().R;
+
+    // 原始畸变补偿
+    auto pts2d_new_undis = pts2d_new_;
+    auto pts2d_new_undis_right = pts2d_new_right_;
+    camera_->undistortPoints(pts2d_new_undis);
+    camera_r_->undistortPoints(pts2d_new_undis_right);
+
+    pts2d_cur_.clear();
+    pts2d_cur_right_.clear();
+    for (const auto &pp_pre : pts2d_new_undis) {
+        Vector3d pc_pre = camera_->pixel2cam(pp_pre);
+        Vector3d pc_cur = r_cur_pre * pc_pre;
+
+        // 添加畸变
+        auto pp_cur = camera_->distortCameraPoint(pc_cur);
+        pts2d_cur_.emplace_back(pp_cur);
+    }
+
+    for (const auto &pp_pre : pts2d_new_undis_right) {
+        Vector3d pc_pre = camera_r_->pixel2cam(pp_pre);
+        Vector3d pc_cur = r_cur_pre_r * pc_pre;   // TODO 右目的姿态
+
+        // 添加畸变
+        auto pp_cur = camera_r_->distortCameraPoint(pc_cur);
+        pts2d_cur_right_.emplace_back(pp_cur);
+    }
+
+    // 跟踪参考帧
+    vector<uint8_t> status_left, status_reverse, status_right, status_right_reverse, status;
+    vector<float> error;
+    vector<cv::Point2f> pts2d_reverse = pts2d_new_;
+    vector<cv::Point2f> pts2d_right_reverse = pts2d_new_right_;
+
+    // 正向光流
+    cv::calcOpticalFlowPyrLK(frame_pre_->image(), frame_cur_->image(), pts2d_new_, pts2d_cur_, status_left, error,
+                             cv::Size(21, 21), TRACK_PYRAMID_LEVEL,
+                             cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01),
+                             cv::OPTFLOW_USE_INITIAL_FLOW);
+
+    // 反向光流
+    cv::calcOpticalFlowPyrLK(frame_cur_->image(), frame_pre_->image(), pts2d_cur_, pts2d_reverse, status_reverse, error,
+                             cv::Size(21, 21), TRACK_PYRAMID_LEVEL,
+                             cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01),
+                             cv::OPTFLOW_USE_INITIAL_FLOW);
+
+    // 右目正向光流
+    cv::calcOpticalFlowPyrLK(frame_pre_->rightImage(), frame_cur_->rightImage(), pts2d_new_right_, pts2d_cur_right_, status_right, error,
+                             cv::Size(21, 21), TRACK_PYRAMID_LEVEL,
+                             cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01),
+                             cv::OPTFLOW_USE_INITIAL_FLOW);
+
+    // 右目反向光流
+    cv::calcOpticalFlowPyrLK(frame_cur_->rightImage(), frame_pre_->rightImage(), pts2d_cur_right_, pts2d_right_reverse, status_right_reverse, error,
+                             cv::Size(21, 21), TRACK_PYRAMID_LEVEL,
+                             cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01),
+                             cv::OPTFLOW_USE_INITIAL_FLOW);
+
+    // 剔除跟踪失败的, 正向反向跟踪在0.5个像素以内
+    for (size_t k = 0; k < status_left.size(); k++) {
+        if (status_left[k] && status_reverse[k] && !isOnBorder(pts2d_cur_[k]) &&
+            (ptsDistance(pts2d_reverse[k], pts2d_new_[k]) < 0.5)) {
+            status_left[k] = 1;
+        } else {
+            status_left[k] = 0;
+        }
+    }
+    // 剔除右目
+    for (size_t k = 0; k < status_right.size(); k++) {
+        if (status_right[k] && status_right_reverse[k] && !isOnBorder(pts2d_cur_right_[k]) &&
+            (ptsDistance(pts2d_right_reverse[k], pts2d_new_right_[k]) < 0.5)) {
+            status_right[k] = 1;
+        } else {
+            status_right[k] = 0;
+        }
+    }
+
+    for (size_t i = 0; i < status.size(); i++) {
+        if (status_left[i] == 1 || status_right[i] == 1) {
+            status.push_back(1);
+        } else {
+            status.push_back(0);
+        }
+    }
+    reduceVector(pts2d_ref_, status);
+    reduceVector(pts2d_cur_, status);
+    reduceVector(pts2d_new_, status);
+    reduceVector(pts2d_new_right_, status);
+    reduceVector(pts2d_cur_right_, status);
+    reduceVector(pts2d_ref_right_, status);
+    // TODO 
+    reduceVector(pts2d_ref_frame_, status);
+    reduceVector(velocity_ref_, status);    // 速度没考虑右目，有左目用左目，没左目再用右目
+
+    if (pts2d_ref_.empty()) {
+        LOGW << "No new feature in previous frame";
+        drawer_->updateTrackedRefPoints({}, {});    // 这里用了个纯虚函数
+        return false;
+    }
+
+    // 原始带畸变的角点
+    pts2d_new_undis             = pts2d_new_;
+    pts2d_new_undis_right       = pts2d_new_right_; 
+    auto pts2d_cur_undis        = pts2d_cur_;
+    auto pts2d_cur_right_undis  = pts2d_cur_right_;
+
+    camera_->undistortPoints(pts2d_new_undis);
+    camera_->undistortPoints(pts2d_cur_undis);
+    camera_r_->undistortPoints(pts2d_new_undis_right);
+    camera_r_->undistortPoints(pts2d_cur_right_undis);
+
+    // 计算像素速度
+    velocity_cur_.clear();
+    double dt = frame_cur_->stamp() - frame_pre_->stamp();
+
+    for (size_t k = 0; k < status.size(); k++) {
+        Vector2d velocity;
+        if (status_left[k] == 1) {
+            Vector3d vel      = (camera_->pixel2cam(pts2d_cur_undis[k]) - camera_->pixel2cam(pts2d_new_undis[k])) / dt;
+            velocity = {vel.x(), vel.y()};
+        } else if (status_right[k] == 1) {
+            Vector3d vel      = (camera_r_->pixel2cam(pts2d_cur_right_undis[k]) - camera_r_->pixel2cam(pts2d_new_undis_right[k])) / dt;
+            velocity = {vel.x(), vel.y()};
+        }
+        velocity_cur_.push_back(velocity);
+
+        // 在关键帧后新增加的特征
+        if (pts2d_ref_frame_[k]->id() > frame_ref_->id()) {
+            velocity_ref_[k] = velocity;
+        }
+    }
+
+    // 计算视差
+    auto pts2d_ref_undis = pts2d_ref_;
+    camera_->undistortPoints(pts2d_ref_undis);
+    parallax_ref_counts_ = parallaxFromReferenceKeyPoints(pts2d_ref_undis, pts2d_cur_undis, parallax_ref_);
+
+    // Fundamental粗差剔除
+    if (pts2d_cur_.size() >= 15) {
+        cv::findFundamentalMat(pts2d_new_undis, pts2d_cur_undis, cv::FM_RANSAC, reprojection_error_std_, 0.99, status);
+
+        reduceVector(pts2d_ref_, status);
+        reduceVector(pts2d_ref_right_, status);
+        reduceVector(pts2d_cur_, status);
+        reduceVector(pts2d_cur_right_, status);
+        reduceVector(pts2d_ref_frame_, status);
+        reduceVector(velocity_cur_, status);
+        reduceVector(velocity_ref_, status);
+    }
+
+    if (pts2d_cur_.empty()) {
+        LOGW << "No new feature in previous frame";
+        drawer_->updateTrackedRefPoints({}, {});
+        return false;
+    }
+
+    // 从参考帧跟踪过来的新特征点
+    if (is_use_visualization_) {
+        drawer_->updateTrackedRefPoints(pts2d_ref_, pts2d_cur_);
+    }
+
+    // 用于下一帧的跟踪
+    pts2d_new_ = pts2d_cur_;
+    pts2d_new_right_ = pts2d_cur_right_;
+
+
+    LOGI << "Track " << pts2d_new_.size() << " reference points";
+
+    return !pts2d_new_.empty();
 }
 
 bool Tracking::trackReferenceFrame() {
@@ -586,6 +1107,148 @@ bool Tracking::trackReferenceFrame() {
     LOGI << "Track " << pts2d_new_.size() << " reference points";
 
     return !pts2d_new_.empty();
+}
+
+/**
+ * @brief 右目是直接用光流提取的
+*/
+void Tracking::featuresDetectionStereo(Frame::Ptr &frame, bool ismask, bool is_stereo) {
+    if(!is_stereo)
+    {
+        featuresDetection(frame, ismask);
+    }
+    else
+    {
+        int num_features = static_cast<int>(frame->features().size() + pts2d_ref_.size());
+        if (num_features > (track_max_features_ - 5)) {
+            return;
+        }
+
+        int features_cnts[block_cnts_];
+        vector<vector<cv::Point2f>> block_features(block_cnts_);
+        for (auto &block : block_features) {
+            block.reserve(track_max_block_features_);
+        }
+        for (int k = 0; k < block_cnts_; k++) {
+            features_cnts[k] = 0;
+        }
+
+        int col, row;
+        for (const auto &feature : frame->features()) {
+            col = int(feature.second->keyPoint().x / (float) block_indexs_[0].first);
+            row = int(feature.second->keyPoint().y / (float) block_indexs_[0].second);
+            features_cnts[row * block_cols_ + col]++;
+        }
+        for (auto &pts2d : pts2d_new_) {
+            col = int(pts2d.x / (float) block_indexs_[0].first);
+            row = int(pts2d.y / (float) block_indexs_[0].second);
+            features_cnts[row * block_cols_ + col]++;
+        }
+
+        // 设置感兴趣区域, 没有特征的区域
+        Mat mask = Mat(camera_->size(), CV_8UC1, 255);
+        if (ismask) {
+            // 已经跟踪上的点
+            for (const auto &pt : frame_cur_->features()) {
+                cv::circle(mask, pt.second->keyPoint(), track_min_pixel_distance_, 0, cv::FILLED);
+            }
+
+            // 还在跟踪的点
+            for (const auto &pts2d : pts2d_new_) {
+                cv::circle(mask, pts2d, track_min_pixel_distance_, 0, cv::FILLED);
+            }
+        }
+
+        // 亚像素角点提取参数
+        cv::Size win_size          = cv::Size(5, 5);
+        cv::Size zero_zone         = cv::Size(-1, -1);
+        // COUNT是达到最大迭代次数，EPS是达到迭代精度，两者可以同时使用
+        cv::TermCriteria term_crit = cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 20, 0.01);
+
+        // 这里只是把左目的用这个提取出来，右目的用光流跟
+        auto tracking_function = [&](const tbb::blocked_range<int> &range) {
+            for (int k = range.begin(); k != range.end(); k++) {
+                int blocl_track_num = track_max_block_features_ - features_cnts[k];
+                if (blocl_track_num > 0) {
+
+                    int cols = k % block_cols_; // 取余数，对应的就是列
+                    int rows = k / block_cols_; // 取整，对应行
+
+                    int col_sta = cols * block_indexs_[0].first;    // 四个角的索引
+                    int col_end = col_sta + block_indexs_[0].first;
+                    int row_sta = rows * block_indexs_[0].second;
+                    int row_end = row_sta + block_indexs_[0].second;
+                    if (k != (block_cnts_ - 1)) {
+                        col_end -= 5;
+                        row_end -= 5;
+                    }
+
+                    Mat block_image = frame->image().colRange(col_sta, col_end).rowRange(row_sta, row_end);
+                    Mat block_mask  = mask.colRange(col_sta, col_end).rowRange(row_sta, row_end);
+
+                    cv::goodFeaturesToTrack(block_image, block_features[k], blocl_track_num, 0.01,
+                                        track_min_pixel_distance_, block_mask);
+                    if (!block_features[k].empty()) {
+                        // 获取亚像素角点
+                        // block_features 既输入又输出
+                        cv::cornerSubPix(block_image, block_features[k], win_size, zero_zone, term_crit);
+                    }
+                }
+            }
+        };
+        tbb::parallel_for(tbb::blocked_range<int>(0, block_cnts_), tracking_function);
+
+        // 调整角点的坐标
+        int num_new_features = 0;
+
+        // 连续跟踪的角点, 未三角化的点
+        if (!ismask) {
+            pts2d_new_.clear();
+            pts2d_ref_.clear();
+            pts2d_ref_frame_.clear();
+            velocity_ref_.clear();
+        }
+
+        for (int k = 0; k < block_cnts_; k++) {
+            col = k % block_cols_;
+            row = k / block_cols_;
+
+            for (const auto &point : block_features[k]) {
+                float x = static_cast<float>(col * block_indexs_[0].first) + point.x;   // 恢复特征点在图像上的坐标
+                float y = static_cast<float>(row * block_indexs_[0].second) + point.y;
+
+                auto pts2d = cv::Point2f(x, y);
+                pts2d_ref_.push_back(pts2d);
+                pts2d_new_.push_back(pts2d);
+                pts2d_ref_frame_.push_back(frame);
+                velocity_ref_.emplace_back(0, 0);
+
+                num_new_features++;
+            }
+        }
+
+        // LOGI << "Add " << num_new_features << " new features to image(befor LK)" << num_features;
+
+        std::vector<cv::Point2f> left_features_reverse;
+        std::vector<uchar> status, status_reverse;
+        std::vector<float> err;
+        pts2d_new_right_.resize(pts2d_new_.size());
+        cv::calcOpticalFlowPyrLK(frame->image(), frame->rightImage(), pts2d_new_, pts2d_new_right_, status, err, cv::Size(21, 21), 5);
+        // 逆向光流
+        cv::calcOpticalFlowPyrLK(frame->rightImage(), frame->image(), pts2d_new_right_, left_features_reverse, status_reverse, err, cv::Size(21, 21), 5);
+        for (int i = 0; i < status.size(); i++) {
+            if (status[i] && status_reverse[i] && ptsDistance(pts2d_new_[i], left_features_reverse[i]) && isOnBorder(pts2d_new_right_[i])) {
+                status[i] = 1;
+            } else {
+                status[i] = 0;
+            }
+        }
+
+        reduceVector(pts2d_ref_, status);
+        reduceVector(pts2d_new_, status);
+        reduceVector(pts2d_new_right_, status); // TODO
+        pts2d_ref_right_ = pts2d_new_right_;
+    }
 }
 
 void Tracking::featuresDetection(Frame::Ptr &frame, bool ismask) {
@@ -811,6 +1474,193 @@ bool Tracking::triangulation() {
     reduceVector(pts2d_ref_, status);
     reduceVector(pts2d_ref_frame_, status);
     reduceVector(pts2d_cur_, status);
+    reduceVector(velocity_ref_, status);
+
+    pts2d_new_ = pts2d_cur_;
+
+    LOGI << "Triangulate " << num_succeeded << " 3D points with " << pts2d_cur_.size() << " left, " << num_reset
+         << " reset, " << num_outtime << " outtime and " << num_outlier << " outliers";
+    return true;
+}
+
+bool Tracking::triangulationStereo() {
+    // 无跟踪上的特征
+    if (pts2d_cur_.empty()) {
+        return false;
+    }
+
+    Pose pose0;
+    Pose pose1  = frame_cur_->pose();
+    Pose pose1r = frame_cur_->poseR();
+
+    Eigen::Matrix<double, 3, 4> T_c_w_0, T_c_w_1, T_c_w_1_r;
+    T_c_w_1    = pose2Tcw(pose1).topRows<3>();
+    T_c_w_1_r  = pose2Tcw(pose1r).topRows<3>();
+
+    int num_succeeded = 0;
+    int num_outlier   = 0;
+    int num_reset     = 0;
+    int num_outtime   = 0;
+
+    // 原始带畸变的角点
+    auto pts2d_ref_undis        = pts2d_ref_;
+    auto pts2d_ref_undis_right  = pts2d_ref_right_;
+    auto pts2d_cur_undis        = pts2d_cur_;
+    auto pts2d_cur_undis_right  = pts2d_cur_right_;
+
+    // 矫正畸变以进行三角化
+    camera_->undistortPoints(pts2d_ref_undis);
+    camera_->undistortPoints(pts2d_cur_undis);
+    camera_r_->undistortPoints(pts2d_cur_undis_right);
+
+    // 双目三角化
+    if (is_stereo_)
+    {
+        vector<uint8_t> status(pts2d_cur_undis.size(), 1);
+        for (size_t k = 0; k < pts2d_cur_undis.size(); k++) {
+            auto ppl = pts2d_cur_undis[k];
+            auto ppr = pts2d_cur_undis_right[k];
+
+            Vector3d pc_cur_l = camera_->pixel2cam(pts2d_cur_undis[k]);
+            Vector3d pc_cur_r = camera_r_->pixel2cam(pts2d_cur_undis_right[k]);
+            Vector3d pc3d;
+
+            triangulatePoint(T_c_w_1, T_c_w_1_r, pc_cur_l, pc_cur_r, pc3d);
+
+            // 双目三角化也加个限制，双目三角化失败的直接剔除？
+            if (!isGoodToTrack(ppl, pose1, pc3d, 1.0, 3.0) || !isGoodToTrack(ppr, pose1r, pc3d, 1.0, 3.0)) {
+                status[k] = 0;
+                continue;
+            }
+
+            // 新的路标点, 加入新的观测, 路标点加入地图
+            auto frame_ref = pts2d_ref_frame_[k];   // 这里只是单纯提供个位姿
+            auto pc        = camera_->world2cam(pc3d, frame_ref->pose());
+            double depth   = pc.z();
+            auto mappoint  = MapPoint::createMapPoint(frame_ref, pc3d, pts2d_ref_undis[k], depth, MAPPOINT_TRIANGULATED);
+
+            auto feature  = Feature::createFeature(frame_cur_, velocity_cur_[k], pts2d_cur_undis[k], pts2d_cur_[k],
+                                              FEATURE_TRIANGULATED);
+            auto featurer = Feature::createFeature(frame_cur_, velocity_cur_[k], pts2d_cur_undis_right[k], pts2d_cur_right_[k],
+                                              FEATURE_TRIANGULATED);    // 这里只是单纯的增加了个右目的feature
+            mappoint->addObservation(feature);
+            mappoint->addRightObservation(featurer);
+            mappoint->setRightKeypoint(pts2d_ref_undis_right[k]);
+            // mappoint->addObservation(featurer);
+            feature->addMapPoint(mappoint);
+            featurer->addMapPoint(mappoint);
+            feature->setRightFeature(featurer);
+            frame_cur_->addFeature(mappoint->id(), feature);
+            frame_cur_->addFeatureRight(mappoint->id(), featurer);
+            mappoint->increaseUsedTimes();
+
+            // 新三角化的路标点缓存到最新的关键帧, 不直接加入地图
+            frame_cur_->addNewUnupdatedMappoint(mappoint);
+        }
+
+        // 剔除双目三角化失败的点
+        reduceVector(pts2d_ref_, status);
+        reduceVector(pts2d_ref_right_, status);
+        reduceVector(pts2d_ref_frame_, status);
+        reduceVector(pts2d_cur_, status);
+        reduceVector(pts2d_cur_right_, status);
+        reduceVector(velocity_ref_, status);
+    }
+
+    // 这下边就是两帧的三角化
+    // 计算使用齐次坐标, 相机坐标系
+    vector<uint8_t> status;
+    for (size_t k = 0; k < pts2d_cur_.size(); k++) {
+        auto pp0 = pts2d_ref_undis[k];
+        auto pp1 = pts2d_cur_undis[k];
+
+        // 参考帧
+        auto frame_ref = pts2d_ref_frame_[k];
+        if (frame_ref->id() > frame_ref_->id()) {
+            // 中途添加的特征, 修改参考帧
+            pts2d_ref_frame_[k] = frame_cur_;
+            pts2d_ref_[k]       = pts2d_cur_[k];
+            status.push_back(1);
+            num_reset++;
+            continue;
+        }
+
+        // 移除长时间跟踪导致参考帧已经不在窗口内的观测
+        if (map_->isWindowNormal() && !map_->isKeyFrameInMap(frame_ref)) {
+            status.push_back(0);
+            num_outtime++;
+            continue;
+        }
+
+        // 进行必要的视差检查, 保证三角化有效
+        pose0           = frame_ref->pose();
+        double parallax = keyPointParallax(pts2d_ref_undis[k], pts2d_cur_undis[k], pose0, pose1);
+        if (parallax < TRACK_MIN_PARALLAX) {
+            status.push_back(1);
+            continue;
+        }
+
+        T_c_w_0 = pose2Tcw(pose0).topRows<3>();
+
+        // 三角化
+        Vector3d pc0 = camera_->pixel2cam(pts2d_ref_undis[k]);
+        Vector3d pc1 = camera_->pixel2cam(pts2d_cur_undis[k]);
+        Vector3d pw;
+        triangulatePoint(T_c_w_0, T_c_w_1, pc0, pc1, pw);
+
+        // 三角化错误的点剔除
+        if (!isGoodToTrack(pp0, pose0, pw, 1.0, 3.0) || !isGoodToTrack(pp1, pose1, pw, 1.0, 3.0)) {
+            status.push_back(0);
+            num_outlier++;
+            continue;
+        }
+        status.push_back(0);
+        num_succeeded++;
+
+        // 新的路标点, 加入新的观测, 路标点加入地图
+        auto pc       = camera_->world2cam(pw, frame_ref->pose());
+        double depth  = pc.z();
+        auto mappoint = MapPoint::createMapPoint(frame_ref, pw, pts2d_ref_undis[k], depth, MAPPOINT_TRIANGULATED);
+
+        auto feature  = Feature::createFeature(frame_cur_, velocity_cur_[k], pts2d_cur_undis[k], pts2d_cur_[k],
+                                              FEATURE_TRIANGULATED);
+        auto featurer = Feature::createFeature(frame_cur_, velocity_cur_[k], pts2d_cur_undis_right[k], pts2d_cur_right_[k],
+                                              FEATURE_TRIANGULATED);
+        mappoint->addObservation(feature);
+        mappoint->addRightObservation(featurer);
+        mappoint->setRightKeypoint(pts2d_ref_undis_right[k]);
+        feature->addMapPoint(mappoint);
+        featurer->addMapPoint(mappoint);
+        feature->setRightFeature(featurer);
+        feature->setRightFeature(featurer);
+        frame_cur_->addFeature(mappoint->id(), feature);
+        frame_cur_->addFeatureRight(mappoint->id(), featurer);
+        mappoint->increaseUsedTimes();
+
+        feature  = Feature::createFeature(frame_ref, velocity_ref_[k], pts2d_ref_undis[k], pts2d_ref_[k],
+                                         FEATURE_TRIANGULATED);
+        featurer = Feature::createFeature(frame_ref, velocity_ref_[k], pts2d_ref_undis_right[k], pts2d_ref_right_[k],
+                                         FEATURE_TRIANGULATED);
+        mappoint->addObservation(feature);
+        mappoint->addRightObservation(featurer);
+        mappoint->setRightKeypoint(pts2d_ref_undis_right[k]);
+        feature->addMapPoint(mappoint);
+        featurer->addMapPoint(mappoint);
+        frame_ref->addFeature(mappoint->id(), feature);
+        frame_ref->addFeatureRight(mappoint->id(), featurer);
+        mappoint->increaseUsedTimes();
+
+        // 新三角化的路标点缓存到最新的关键帧, 不直接加入地图
+        frame_cur_->addNewUnupdatedMappoint(mappoint);
+    }
+
+    // 由于视差不够未及时三角化的角点
+    // 右目要和左目保持一致，所以这里一起给删了
+    reduceVector(pts2d_ref_, status);
+    reduceVector(pts2d_ref_right_, status);
+    reduceVector(pts2d_ref_frame_, status);
+    reduceVector(pts2d_cur_, status);
+    reduceVector(pts2d_cur_right_, status);
     reduceVector(velocity_ref_, status);
 
     pts2d_new_ = pts2d_cur_;

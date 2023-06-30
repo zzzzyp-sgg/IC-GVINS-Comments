@@ -105,9 +105,18 @@ public:
         velocity_[2] = 0;
     }
 
+    void setRightFeature(const std::shared_ptr<Feature> &featurer) {
+        feature_r_ = std::move(featurer);
+    }
+
+    std::shared_ptr<Feature> getRightFeature() {
+        return feature_r_;
+    }
+
 private:
     std::weak_ptr<Frame> frame_;
     std::weak_ptr<MapPoint> mappoint_;
+    std::shared_ptr<Feature> feature_r_ = NULL;
 
     cv::Point2f keypoint_, distorted_keypoint_;
     Vector3d velocity_{0, 0, 0};

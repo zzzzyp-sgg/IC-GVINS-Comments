@@ -55,6 +55,13 @@ void MapPoint::addObservation(const Feature::Ptr &feature) {
     observed_times_++;
 }
 
+void MapPoint::addRightObservation(const Feature::Ptr &featurer) {
+    std::unique_lock<std::mutex> lock(mappoint_mutex_);
+
+    observations_right_.push_back(featurer);
+    // observed_times_++; 右目就先不增加观测次数了吧
+}
+
 void MapPoint::setReferenceFrame(const std::shared_ptr<Frame> &frame, Vector3d pos, cv::Point2f keypoint, double depth,
                                  MapPointType type) {
     std::unique_lock<std::mutex> lock(mappoint_mutex_);

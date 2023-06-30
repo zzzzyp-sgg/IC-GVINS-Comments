@@ -48,7 +48,7 @@ class Tracking {
 public:
     typedef std::shared_ptr<Tracking> Ptr;
 
-    Tracking(Camera::Ptr camera, Map::Ptr map, Drawer::Ptr drawer, const string &configfile, const string &outputpath);
+    Tracking(Camera::Ptr camera, Camera::Ptr camera_r, Map::Ptr map, Drawer::Ptr drawer, const string &configfile, const string &outputpath);
 
     TrackState track(Frame::Ptr frame);
     TrackState trackStereo(Frame::Ptr frame);
@@ -64,19 +64,23 @@ public:
 private:
     void showTracking();
 
-    bool perprocessingStereo(Frame::Ptr frame);
+    bool preprocessingStereo(Frame::Ptr frame);
     bool preprocessing(Frame::Ptr frame);
     static double calculateHistigram(const Mat &image);
 
     void makeNewFrame(int state);
+    void makeNewFrameStereo(int state);
     void writeLoggingMessage();
 
     bool doResetTracking();
+    bool doResetTrackingStereo();
 
     static bool isGoodDepth(double depth, double scale = 1.0);
 
     bool trackReferenceFrame();
+    bool trackReferenceFrameStereo();
     bool trackMappoint();
+    bool trackMappointStereo();
 
     double relativeTranslation();
     double relativeRotation();
@@ -90,9 +94,10 @@ private:
     double keyPointParallax(const cv::Point2f &pp0, const cv::Point2f &pp1, const Pose &pose0, const Pose &pose1);
 
     void featuresDetection(Frame::Ptr &frame, bool ismask = true);
-    void featuresDetectionStereo(Frame::Ptr &frame, bool ismask = true, bool is_stereo);
+    void featuresDetectionStereo(Frame::Ptr &frame, bool ismask = true, bool is_stereo = false);
 
     bool triangulation();
+    bool triangulationStereo();
     static void triangulatePoint(const Eigen::Matrix<double, 3, 4> &pose0, const Eigen::Matrix<double, 3, 4> &pose1,
                                  const Eigen::Vector3d &pc0, const Eigen::Vector3d &pc1, Eigen::Vector3d &pw);
 
@@ -120,6 +125,7 @@ private:
     // 图像帧
     Frame::Ptr frame_cur_, frame_ref_, frame_pre_, last_keyframe_;
     Camera::Ptr camera_;
+    Camera::Ptr camera_r_ = NULL;
     Map::Ptr map_;
     Drawer::Ptr drawer_;
 
@@ -129,11 +135,12 @@ private:
     // 特征点
     // For feature tracking
     vector<cv::Point2f> pts2d_cur_, pts2d_new_, pts2d_ref_;
+    vector<cv::Point2f> pts2d_cur_right_, pts2d_new_right_, pts2d_ref_right_;
     vector<Frame::Ptr> pts2d_ref_frame_;
 
     vector<Eigen::Vector2d> velocity_ref_, velocity_cur_;
 
-    vector<MapPoint::Ptr> tracked_mappoint_, mappoint_matched_;
+    vector<MapPoint::Ptr> tracked_mappoint_, mappoint_matched_, mappoint_matched_right_;
 
     // 分块特征提取, 第一个为分块的长宽, 然后是按照一行一行的分块起始坐标
     // For feature detection

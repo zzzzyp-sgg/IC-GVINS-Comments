@@ -117,16 +117,39 @@ GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr dra
 
     camera_ = Camera::createCamera(intrinsic, distortion, resolution);
 
+    // 双目
+    is_stereo_ = (config["camera_num"].as<int>() == 2) ? 1 : 0;
+    if (is_stereo_) {
+        intrinsic   = config["cam1"]["intrinsic"].as<std::vector<double>>();
+        distortion  = config["cam1"]["distortion"].as<std::vector<double>>();
+        resolution  = config["cam1"]["resolution"].as<std::vector<int>>();
+
+        camera_r_ = Camera::createCamera(intrinsic, distortion, resolution);
+    } else {
+        camera_r_ = NULL;
+    }
+
     // IMU和Camera外参
     // Extrinsic parameters
     vecdata           = config["cam0"]["q_b_c"].as<std::vector<double>>();
     Quaterniond q_b_c = Eigen::Quaterniond(vecdata.data());
     vecdata           = config["cam0"]["t_b_c"].as<std::vector<double>>();
     Vector3d t_b_c    = Eigen::Vector3d(vecdata.data());
-    td_b_c_           = config["cam0"]["td_b_c"].as<double>();
+    td_b_c_           = config["cam0"]["td_b_c"].as<double>();  // 左右目相机认为是同步的
+
 
     pose_b_c_.R = q_b_c.toRotationMatrix();
     pose_b_c_.t = t_b_c;
+
+    if (is_stereo_) {
+        vecdata           = config["cam1"]["q_b_c"].as<std::vector<double>>();
+        Quaterniond q_b_c = Eigen::Quaterniond(vecdata.data());
+        vecdata           = config["cam1"]["t_b_c"].as<std::vector<double>>();
+        Vector3d t_b_c    = Eigen::Vector3d(vecdata.data());
+    }
+
+    pose_b_c_r_.R = q_b_c.toRotationMatrix();
+    pose_b_c_r_.t = t_b_c;
 
     // 优化参数
     // Optimization parameters
@@ -156,7 +179,7 @@ GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr dra
     if (is_use_visualization_) {
         drawer_thread_ = std::thread(&Drawer::run, drawer_);
     }
-    tracking_ = std::make_shared<Tracking>(camera_, map_, drawer_, configfile, outputpath);
+    tracking_ = std::make_shared<Tracking>(camera_, camera_r_, map_, drawer_, configfile, outputpath);
 
     // Process threads
     fusion_thread_       = std::thread(&GVINS::runFusion, this);
@@ -480,7 +503,7 @@ void GVINS::runOptimization() {
 
 void GVINS::runTracking() {
     Frame::Ptr frame;
-    Pose pose;
+    Pose pose, pose_r;
     IntegrationState state, state0, state1; // 这三个在runTracking()里面没用到，不太知道为什么定义在这
 
     std::deque<std::pair<IMU, IntegrationState>> ins_windows;   // 这个也是...
@@ -495,12 +518,18 @@ void GVINS::runTracking() {
         while (!frame_buffer_.empty()) {
             TimeCost timecost;
 
-            Pose pose_b_c;
+            Pose pose_b_c, pose_b_c_r;
             double td;
             {
                 Lock lock3(extrinsic_mutex_);
                 pose_b_c = pose_b_c_;
                 td       = td_b_c_;
+            }
+
+            if (is_stereo_)
+            {
+                Lock lock3(extrinsic_mutex_);
+                pose_b_c_r = pose_b_c_r_;
             }
 
             // 读取缓存
@@ -532,10 +561,17 @@ void GVINS::runTracking() {
                 frame->setStamp(frame->stamp() + td);
                 frame->setTimeDelay(td);
                 MISC::getCameraPoseFromInsWindow(ins_window_, pose_b_c, frame->stamp(), pose);
+                MISC::getCameraPoseFromInsWindow(ins_window_, pose_b_c_r, frame->stamp(), pose_r);
                 frame->setPose(pose);
+                frame->setPoseR(pose_r);
             }
 
-            TrackState trackstate = tracking_->track(frame);
+            TrackState trackstate;
+            if (!is_stereo_) {
+                trackstate = tracking_->track(frame);
+            } else {
+                trackstate = tracking_->trackStereo(frame);
+            }
             if (trackstate == TRACK_LOST) {
                 LOGE << "Tracking lost at " << Logging::doubleData(frame->stamp());
             }
@@ -1065,7 +1101,7 @@ bool GVINS::gvinsOutlierCulling() {
 
         // 路标点在滑动窗口内的所有观测
         // All the observations for mappoint
-        vector<double> errors;
+        vector<double> errors, errors_r;
         for (auto &observation : mappoint->observations()) {
             auto feat = observation.lock();
             if (!feat || feat->isOutlier()) {
@@ -1086,6 +1122,8 @@ bool GVINS::gvinsOutlierCulling() {
             // Feature outlier
             if (!tracking_->isGoodToTrack(pp, frame->pose(), mappoint->pos(), 3.0)) {
                 feat->setOutlier(true);
+                if (is_stereo_)
+                    feat->getRightFeature()->setOutlier(true);
                 mappoint->decreaseUsedTimes();
 
                 // 如果当前观测帧是路标点的参考帧, 直接设置为outlier
@@ -1337,7 +1375,7 @@ void GVINS::updateParametersFromOptimizer() {
                 pose_b_c_ = ext;
             }
 
-            vector<double> extrinsic;
+            vector<double> extrinsic, extrinsic_r;
             Vector3d euler = Rotation::matrix2euler(ext.R) * R2D;
 
             extrinsic.push_back(timelist_.back());
@@ -1349,7 +1387,40 @@ void GVINS::updateParametersFromOptimizer() {
             extrinsic.push_back(euler[2]);
             extrinsic.push_back(td_b_c_);
 
+            if (is_stereo_) 
+            {
+                ext.t[0] = extrinsic_r_[0];
+                ext.t[1] = extrinsic_r_[1];
+                ext.t[2] = extrinsic_r_[2];
+
+                Quaterniond qic = Quaterniond(extrinsic_r_[6], extrinsic_r_[3], extrinsic_r_[4], extrinsic_r_[5]);
+                ext.R           = Rotation::quaternion2matrix(qic.normalized());
+
+                // 外参估计检测, 误差较大则不更新, 1m or 5deg
+                double dt = (ext.t - pose_b_c_r_.t).norm();
+                double dr = Rotation::matrix2quaternion(ext.R * pose_b_c_r_.R.transpose()).vec().norm() * R2D;
+                if ((dt > 1.0) || (dr > 5.0)) {
+                    LOGE << "Estimated extrinsic is too large, t: " << ext.t.transpose()
+                         << ", R: " << Rotation::matrix2euler(ext.R).transpose() * R2D;
+                } else {
+                    // Update the extrinsic
+                    Lock lock(extrinsic_mutex_);
+                    pose_b_c_r_ = ext;
+                }
+
+                Vector3d euler = Rotation::matrix2euler(ext.R) * R2D;
+
+                extrinsic_r.push_back(timelist_.back());
+                extrinsic_r.push_back(ext.t[0]);
+                extrinsic_r.push_back(ext.t[1]);
+                extrinsic_r.push_back(ext.t[2]);
+                extrinsic_r.push_back(euler[0]);
+                extrinsic_r.push_back(euler[1]);
+                extrinsic_r.push_back(euler[2]);
+            }
+
             extfilesaver_->dump(extrinsic);
+            extfilesaver_->dump(extrinsic_r);   // TODO 这里的话，右目更新的外参输出的时候应该也要改下设置？
             extfilesaver_->flush();
         }
     }
@@ -1365,9 +1436,10 @@ void GVINS::updateParametersFromOptimizer() {
 
         IntegrationState state = Preintegration::stateFromData(statedatalist_[index], preintegration_options_);
         frame->setPose(MISC::stateToCameraPose(state, pose_b_c_));
+        frame->setPoseR(MISC::stateToCameraPose(state, pose_b_c_r_));
     }
 
-    // 更新路标点的深度和位置
+    // 更新路标点的深度和位置(这里是以左目为基准更新了)
     // Update the mappoints
     for (const auto &landmark : map_->landmarks()) {
         const auto &mappoint = landmark.second;
@@ -1766,6 +1838,25 @@ void GVINS::addReprojectionParameters(ceres::Problem &problem) {
     if (!optimize_estimate_td_ || gvinsstate_ != GVINS_TRACKING_NORMAL) {
         problem.SetParameterBlockConstant(&extrinsic_[7]);
     }
+
+    if (is_stereo_) {
+        extrinsic_r_[0] = pose_b_c_r_.t[0];
+        extrinsic_r_[1] = pose_b_c_r_.t[1];
+        extrinsic_r_[2] = pose_b_c_r_.t[2];
+
+        qic = Rotation::matrix2quaternion(pose_b_c_r_.R);
+        qic.normalize();
+        extrinsic_r_[3] = qic.x();
+        extrinsic_r_[4] = qic.y();
+        extrinsic_r_[5] = qic.z();
+        extrinsic_r_[6] = qic.w();
+
+        problem.AddParameterBlock(extrinsic_r_, 7, parameterization);
+
+        if (!optimize_estimate_extrinsic_ || gvinsstate_ != GVINS_TRACKING_NORMAL) {
+            problem.SetParameterBlockConstant(extrinsic_r_);
+        }
+    }
 }
 
 vector<ceres::ResidualBlockId> GVINS::addReprojectionFactors(ceres::Problem &problem, bool isusekernel) {
@@ -1839,6 +1930,43 @@ vector<ceres::ResidualBlockId> GVINS::addReprojectionFactors(ceres::Problem &pro
                                          statedatalist_[obs_frame_index].pose, extrinsic_, invdepth, &extrinsic_[7]);
             residual_ids.push_back(residual_block_id);
         }
+
+        if (is_stereo_) 
+        {
+            ref_frame_pc = camera_r_->pixel2cam(mappoint->referenceRightKeypoint());
+            
+            auto observations_right = mappoint->rightObservations();
+            for (auto &observation : observations_right) 
+            {
+                auto obs_feature = observation.lock();
+                if (!obs_feature) { // TODO 右目的outlier何时以及在哪设置
+                    continue;
+                }
+
+                auto obs_frame = obs_feature->getFrame();
+                if (!obs_frame || !obs_frame->isKeyFrame() || !map_->isKeyFrameInMap(obs_frame) ||
+                    (obs_frame == ref_frame)) {
+                    continue;
+                }
+
+                auto obs_frame_pc_right = camera_r_->pixel2cam(obs_feature->keyPoint());
+                size_t obs_frame_index  = getStateDataIndex(obs_frame->stamp());
+
+                if ((obs_frame_index < 0) || (ref_frame_index == obs_frame_index)) {
+                    LOGE << "Wrong matched mapoint right keyframes " << Logging::doubleData(ref_frame->stamp()) << " with "
+                        << Logging::doubleData(obs_frame->stamp());
+                    continue;
+                }
+
+                auto factor = new ReprojectionFactor(ref_frame_pc, obs_frame_pc_right, ref_feature->velocityInPixel(),
+                                                     obs_feature->velocityInPixel(), ref_frame->timeDelay(),
+                                                     obs_frame->timeDelay(), optimize_reprojection_error_std_);
+
+                auto residual_block_id = problem.AddResidualBlock(factor, loss_function, statedatalist_[ref_frame_index].pose,
+                                                                  statedatalist_[obs_frame_index].pose, extrinsic_r_, invdepth, &extrinsic_[7]);
+                residual_ids.push_back(residual_block_id);
+            }
+        }
     }
 
     return residual_ids;
@@ -1856,7 +1984,7 @@ int GVINS::getStateDataIndex(double time) {
 }
 
 void GVINS::addStateParameters(ceres::Problem &problem) {
-    LOGI << "Total " << statedatalist_.size() << " pose states from "
+    LOGI << "Total " << statedatalist_.size() << " pose states from "   // statedatalist_变量只和GNSS和IMU有关
          << Logging::doubleData(statedatalist_.begin()->time) << " to "
          << Logging::doubleData(statedatalist_.back().time);
 

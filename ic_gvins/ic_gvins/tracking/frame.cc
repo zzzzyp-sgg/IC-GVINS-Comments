@@ -34,6 +34,20 @@ Frame::Frame(ulong id, double stamp, Mat image)
     image_.copyTo(raw_image_);
 }
 
+Frame::Frame(ulong id, double stamp, Mat image, Mat right_image)
+    : id_(id)
+    , keyframe_id_(0)
+    , stamp_(stamp)
+    , image_(std::move(image))
+    , right_image_(std::move(right_image))
+    , iskeyframe_(false) {
+    features_.clear();
+    features_right_.clear();
+    unupdated_mappoints_.clear();
+
+    image_.copyTo(raw_image_);
+}
+
 Frame::Ptr Frame::createFrame(double stamp, const Mat &image) {
     // 定义成static，这样frame的id就在一直随着调用增加
     static ulong factory_id = 0;

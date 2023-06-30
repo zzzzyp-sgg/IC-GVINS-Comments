@@ -47,6 +47,7 @@ public:
 
     Frame() = delete;
     Frame(ulong id, double stamp, Mat image);
+    Frame(ulong id, double stamp, Mat image, Mat right_image);
 
     static Frame::Ptr createFrame(double stamp, const Mat &image);
 
@@ -63,6 +64,10 @@ public:
         return image_;
     }
 
+    Mat &rightImage() {
+        return right_image_;
+    }
+
     Mat &rawImage() {
         return raw_image_;
     }
@@ -77,15 +82,38 @@ public:
         pose_ = std::move(pose);
     }
 
+    Pose poseR() {
+        std::unique_lock<std::mutex> lock(frame_mutex_);
+        return pose_r_;
+    }
+
+    void setPoseR(Pose pose) {
+        std::unique_lock<std::mutex> lock(frame_mutex_);
+        pose_r_ = std::move(pose);
+    }
+
     std::unordered_map<ulong, Feature::Ptr> features() {
         std::unique_lock<std::mutex> lock(frame_mutex_);
         return features_;
+    }
+
+    std::unordered_map<ulong, Feature::Ptr> features_right() {
+        std::unique_lock<std::mutex> lock(frame_mutex_);
+        return features_right_;
     }
 
     void clearFeatures() {
         std::unique_lock<std::mutex> lock(frame_mutex_);
 
         features_.clear();
+        unupdated_mappoints_.clear();
+    }
+
+    void clearFeaturesStereo() {
+        std::unique_lock<std::mutex> lock(frame_mutex_);
+
+        features_.clear();
+        features_right_.clear();
         unupdated_mappoints_.clear();
     }
 
@@ -111,6 +139,12 @@ public:
         std::unique_lock<std::mutex> lock(frame_mutex_);
 
         features_.insert(make_pair(mappointid, features));
+    }
+
+    void addFeatureRight(ulong mappointid, const Feature::Ptr &features) {
+        std::unique_lock<std::mutex> lock(frame_mutex_);
+
+        features_right_.insert(make_pair(mappointid, features));
     }
 
     double stamp() const {
@@ -165,12 +199,13 @@ private:
     double td_{0};
 
     Pose pose_;
+    Pose pose_r_;
 
-    Mat image_, raw_image_;
+    Mat image_, raw_image_, right_image_;
 
     bool iskeyframe_;
 
-    std::unordered_map<ulong, Feature::Ptr> features_;
+    std::unordered_map<ulong, Feature::Ptr> features_, features_right_;
     vector<std::shared_ptr<MapPoint>> unupdated_mappoints_;
 };
 
