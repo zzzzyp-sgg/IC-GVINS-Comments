@@ -1,3 +1,8 @@
+# Attention Please
+
+First submitted on 2023.06.30 <br>
+This binocular version of the code simply adds a camera, modifies the tracking thread and optimises some of the code in it. The code has not yet been tested and there are many problems with the code, so I will continue to improve it when I have time.
+
 # IC-GVINS
 
 ## A Robust, Real-time, INS-Centric GNSS-Visual-Inertial Navigation System
