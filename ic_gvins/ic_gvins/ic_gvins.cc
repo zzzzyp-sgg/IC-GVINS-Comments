@@ -146,10 +146,10 @@ GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr dra
         Quaterniond q_b_c = Eigen::Quaterniond(vecdata.data());
         vecdata           = config["cam1"]["t_b_c"].as<std::vector<double>>();
         Vector3d t_b_c    = Eigen::Vector3d(vecdata.data());
-    }
 
-    pose_b_c_r_.R = q_b_c.toRotationMatrix();
-    pose_b_c_r_.t = t_b_c;
+        pose_b_c_r_.R = q_b_c.toRotationMatrix();
+        pose_b_c_r_.t = t_b_c;
+    }
 
     // 优化参数
     // Optimization parameters
